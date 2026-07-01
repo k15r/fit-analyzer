@@ -210,6 +210,19 @@ type Output struct {
 	Splits          []SplitStats     `json:"splits,omitempty" yaml:"splits,omitempty"`
 	SplitSummaries  []SplitSummary   `json:"split_summaries,omitempty" yaml:"split_summaries,omitempty"`
 	HeightProfile   *HeightProfile   `json:"height_profile,omitempty" yaml:"height_profile,omitempty"`
+	GpsTrack        *GpsTrack        `json:"gps_track,omitempty" yaml:"gps_track,omitempty"`
+}
+
+type GpsPoint struct {
+	ElapsedSec int     `json:"elapsed_sec" yaml:"elapsed_sec"`
+	DistanceKm float64 `json:"distance_km" yaml:"distance_km"`
+	Lat        float64 `json:"lat" yaml:"lat"`
+	Lon        float64 `json:"lon" yaml:"lon"`
+}
+
+type GpsTrack struct {
+	IntervalSec int        `json:"interval_sec" yaml:"interval_sec"`
+	Points      []GpsPoint `json:"points" yaml:"points"`
 }
 
 type HeightProfilePoint struct {
@@ -715,7 +728,52 @@ func buildHeightProfile(records []*mesgdef.Record) *HeightProfile {
 
 // ---- main ----
 
-func analyzeFile(path string) (Output, error) {
+func buildGpsTrack(records []*mesgdef.Record, intervalSec int) *GpsTrack {
+	if intervalSec <= 0 {
+		return nil
+	}
+
+	var points []GpsPoint
+	var startTime time.Time
+	lastEmittedSec := -intervalSec // emit first valid point immediately
+
+	for _, r := range records {
+		lat := r.PositionLatDegrees()
+		lon := r.PositionLongDegrees()
+		if math.IsNaN(lat) || math.IsNaN(lon) {
+			continue
+		}
+		dist := optDist32(r.Distance)
+		if dist == nil {
+			continue
+		}
+
+		if startTime.IsZero() {
+			startTime = r.Timestamp
+		}
+		elapsed := int(r.Timestamp.Sub(startTime).Seconds())
+
+		if elapsed-lastEmittedSec >= intervalSec {
+			points = append(points, GpsPoint{
+				ElapsedSec: elapsed,
+				DistanceKm: round3(*dist / 1000.0),
+				Lat:        math.Round(lat*1e6) / 1e6,
+				Lon:        math.Round(lon*1e6) / 1e6,
+			})
+			lastEmittedSec = elapsed
+		}
+	}
+
+	if len(points) == 0 {
+		return nil
+	}
+	return &GpsTrack{
+		IntervalSec: intervalSec,
+		Points:      points,
+	}
+}
+
+func analyzeFile(path string, gpsIntervalSec int) (Output, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return Output{}, fmt.Errorf("opening file: %w", err)
@@ -760,13 +818,15 @@ func analyzeFile(path string) (Output, error) {
 		Splits:          splits,
 		SplitSummaries:  summaries,
 		HeightProfile:   buildHeightProfile(activity.Records),
+		GpsTrack:        buildGpsTrack(activity.Records, gpsIntervalSec),
 	}, nil
 }
 
 func main() {
 	outputFmt := flag.String("format", "yaml", "output format: yaml or json")
+	gpsInterval := flag.Int("gps-interval", 60, "GPS track sampling interval in seconds (0 to disable)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: fit-analyzer [--format yaml|json] <file.fit> [file2.fit ...]\n")
+		fmt.Fprintf(os.Stderr, "Usage: fit-analyzer [--format yaml|json] [--gps-interval N] <file.fit> [file2.fit ...]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -779,7 +839,7 @@ func main() {
 	exitCode := 0
 	outputs := make([]Output, 0, flag.NArg())
 	for _, path := range flag.Args() {
-		out, err := analyzeFile(path)
+		out, err := analyzeFile(path, *gpsInterval)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
 			exitCode = 1
