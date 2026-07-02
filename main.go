@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/muktihari/fit/decoder"
@@ -214,15 +216,18 @@ type Output struct {
 }
 
 type GpsPoint struct {
-	ElapsedSec int     `json:"elapsed_sec" yaml:"elapsed_sec"`
-	DistanceKm float64 `json:"distance_km" yaml:"distance_km"`
-	Lat        float64 `json:"lat" yaml:"lat"`
-	Lon        float64 `json:"lon" yaml:"lon"`
+	ElapsedSec   int      `json:"elapsed_sec" yaml:"elapsed_sec"`
+	DistanceKm   float64  `json:"distance_km" yaml:"distance_km"`
+	Lat          float64  `json:"lat" yaml:"lat"`
+	Lon          float64  `json:"lon" yaml:"lon"`
+	AltitudeFitM *float64 `json:"altitude_fit_m,omitempty" yaml:"altitude_fit_m,omitempty"`
+	AltitudeApiM *float64 `json:"altitude_api_m,omitempty" yaml:"altitude_api_m,omitempty"`
 }
 
 type GpsTrack struct {
-	IntervalSec int        `json:"interval_sec" yaml:"interval_sec"`
-	Points      []GpsPoint `json:"points" yaml:"points"`
+	IntervalSec  int        `json:"interval_sec,omitempty" yaml:"interval_sec,omitempty"`
+	IntervalM    int        `json:"interval_m,omitempty" yaml:"interval_m,omitempty"`
+	Points       []GpsPoint `json:"points" yaml:"points"`
 }
 
 type HeightProfilePoint struct {
@@ -632,16 +637,112 @@ func buildWorkout(wkts []*mesgdef.Workout, steps []*mesgdef.WorkoutStep) *Workou
 	return wi
 }
 
+// ---- Open-Meteo elevation ----
+
+// fetchOpenMeteoElevation fetches terrain elevations for a batch of coordinates.
+// Splits into chunks of 100 to respect the API limit.
+func fetchOpenMeteoElevation(lats, lons []float64) ([]float64, error) {
+	const batchSize = 100
+	client := &http.Client{Timeout: 10 * time.Second}
+	result := make([]float64, 0, len(lats))
+
+	for start := 0; start < len(lats); start += batchSize {
+		end := start + batchSize
+		if end > len(lats) {
+			end = len(lats)
+		}
+		bLats := lats[start:end]
+		bLons := lons[start:end]
+
+		latStrs := make([]string, len(bLats))
+		lonStrs := make([]string, len(bLons))
+		for i, v := range bLats {
+			latStrs[i] = fmt.Sprintf("%.6f", v)
+		}
+		for i, v := range bLons {
+			lonStrs[i] = fmt.Sprintf("%.6f", v)
+		}
+		url := "https://api.open-meteo.com/v1/elevation?latitude=" +
+			strings.Join(latStrs, ",") + "&longitude=" + strings.Join(lonStrs, ",")
+
+		resp, err := client.Get(url)
+		if err != nil {
+			return nil, fmt.Errorf("open-meteo elevation request: %w", err)
+		}
+		var body struct {
+			Elevation []float64 `json:"elevation"`
+			Error     bool      `json:"error"`
+			Reason    string    `json:"reason"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("open-meteo elevation decode: %w", err)
+		}
+		if body.Error {
+			return nil, fmt.Errorf("open-meteo elevation API error: %s", body.Reason)
+		}
+		if len(body.Elevation) != len(bLats) {
+			return nil, fmt.Errorf("open-meteo elevation: got %d values for %d points", len(body.Elevation), len(bLats))
+		}
+		result = append(result, body.Elevation...)
+	}
+	return result, nil
+}
+
+// computeAscentDescent sums elevation gains and losses from a sequence of altitudes.
+// A Gaussian-weighted smoothing pass (window=5) is applied first to suppress
+// SRTM measurement noise before differencing.
+func computeAscentDescent(alts []float64) (ascent, descent int) {
+	if len(alts) < 2 {
+		return
+	}
+
+	// Smooth with a simple 5-point moving average to suppress SRTM noise
+	smoothed := make([]float64, len(alts))
+	weights := []float64{1, 2, 3, 2, 1} // triangle kernel
+	for i := range alts {
+		var s, w float64
+		for j, wj := range weights {
+			idx := i + j - 2
+			if idx < 0 {
+				idx = 0
+			} else if idx >= len(alts) {
+				idx = len(alts) - 1
+			}
+			s += alts[idx] * wj
+			w += wj
+		}
+		smoothed[i] = s / w
+	}
+
+	var totalAscent, totalDescent float64
+	for i := 1; i < len(smoothed); i++ {
+		d := smoothed[i] - smoothed[i-1]
+		if d > 0 {
+			totalAscent += d
+		} else if d < 0 {
+			totalDescent -= d
+		}
+	}
+	ascent = int(math.Round(totalAscent))
+	descent = int(math.Round(totalDescent))
+	return
+}
+
 // ---- height profile ----
 
 // buildHeightProfile samples altitude adaptively from raw records.
+// If apiAltsByDist is non-nil it maps distance_m → terrain elevation from an
+// external API; the nearest available API value replaces the FIT altitude for
+// each sampled point (linear search over the small sorted key set is fine).
 // A new point is emitted when:
 //   - at least minDistM metres have passed since the last point AND
 //     the altitude has changed by at least steepThreshM metres (steep section), OR
 //   - maxDistM metres have passed since the last point (flat keep-alive).
 //
 // The final record is always emitted.
-func buildHeightProfile(records []*mesgdef.Record) *HeightProfile {
+func buildHeightProfile(records []*mesgdef.Record, apiAltsByDist map[float64]float64) *HeightProfile {
 	const (
 		minDistM     = 50.0  // minimum spacing between any two points
 		maxDistM     = 1000.0 // maximum spacing on flat terrain
@@ -652,12 +753,30 @@ func buildHeightProfile(records []*mesgdef.Record) *HeightProfile {
 	type raw struct{ dist, alt float64 }
 	var pts []raw
 	for _, r := range records {
-		alt := optAlt32(r.EnhancedAltitude)
+		dist := optDist32(r.Distance)
+		if dist == nil {
+			continue
+		}
+		var alt *float64
+		if apiAltsByDist != nil {
+			// Find the nearest GPS track point by distance
+			best := math.MaxFloat64
+			var bestAlt float64
+			for distKey, a := range apiAltsByDist {
+				if d := math.Abs(*dist - distKey); d < best {
+					best = d
+					bestAlt = a
+				}
+			}
+			alt = &bestAlt
+		}
+		if alt == nil {
+			alt = optAlt32(r.EnhancedAltitude)
+		}
 		if alt == nil {
 			alt = optAlt16(r.Altitude)
 		}
-		dist := optDist32(r.Distance)
-		if alt == nil || dist == nil {
+		if alt == nil {
 			continue
 		}
 		pts = append(pts, raw{*dist, *alt})
@@ -728,14 +847,15 @@ func buildHeightProfile(records []*mesgdef.Record) *HeightProfile {
 
 // ---- main ----
 
-func buildGpsTrack(records []*mesgdef.Record, intervalSec int) *GpsTrack {
-	if intervalSec <= 0 {
+func buildGpsTrack(records []*mesgdef.Record, intervalSec int, intervalDistM int) *GpsTrack {
+	if intervalSec <= 0 && intervalDistM <= 0 {
 		return nil
 	}
 
 	var points []GpsPoint
 	var startTime time.Time
-	lastEmittedSec := -intervalSec // emit first valid point immediately
+	lastEmittedSec := -intervalSec
+	lastEmittedDistM := -float64(intervalDistM)
 
 	for _, r := range records {
 		lat := r.PositionLatDegrees()
@@ -753,27 +873,48 @@ func buildGpsTrack(records []*mesgdef.Record, intervalSec int) *GpsTrack {
 		}
 		elapsed := int(r.Timestamp.Sub(startTime).Seconds())
 
-		if elapsed-lastEmittedSec >= intervalSec {
-			points = append(points, GpsPoint{
+		var emit bool
+		if intervalDistM > 0 {
+			emit = *dist-lastEmittedDistM >= float64(intervalDistM)
+		} else {
+			emit = elapsed-lastEmittedSec >= intervalSec
+		}
+
+		if emit {
+			pt := GpsPoint{
 				ElapsedSec: elapsed,
 				DistanceKm: round3(*dist / 1000.0),
 				Lat:        math.Round(lat*1e6) / 1e6,
 				Lon:        math.Round(lon*1e6) / 1e6,
-			})
+			}
+			// attach FIT altitude if available
+			alt := optAlt32(r.EnhancedAltitude)
+			if alt == nil {
+				alt = optAlt16(r.Altitude)
+			}
+			if alt != nil {
+				v := math.Round(*alt*10) / 10
+				pt.AltitudeFitM = &v
+			}
+			points = append(points, pt)
 			lastEmittedSec = elapsed
+			lastEmittedDistM = *dist
 		}
 	}
 
 	if len(points) == 0 {
 		return nil
 	}
-	return &GpsTrack{
-		IntervalSec: intervalSec,
-		Points:      points,
+	track := &GpsTrack{Points: points}
+	if intervalDistM > 0 {
+		track.IntervalM = intervalDistM
+	} else {
+		track.IntervalSec = intervalSec
 	}
+	return track
 }
 
-func analyzeFile(path string, gpsIntervalSec int) (Output, error) {
+func analyzeFile(path string, gpsIntervalSec int, gpsDistIntervalM int, elevationSource string) (Output, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return Output{}, fmt.Errorf("opening file: %w", err)
@@ -809,22 +950,56 @@ func analyzeFile(path string, gpsIntervalSec int) (Output, error) {
 		summaries = append(summaries, buildSplitSummary(s))
 	}
 
+	gpsTrack := buildGpsTrack(activity.Records, gpsIntervalSec, gpsDistIntervalM)
+	meta := buildMetadata(sess)
+
+	// Fetch Open-Meteo elevations for the GPS track points and use them for
+	// the height profile and ascent/descent computation.
+	var apiAltsByDist map[float64]float64 // dist_m → api altitude
+	if elevationSource == "open-meteo" && gpsTrack != nil && len(gpsTrack.Points) > 0 {
+		lats := make([]float64, len(gpsTrack.Points))
+		lons := make([]float64, len(gpsTrack.Points))
+		for i, pt := range gpsTrack.Points {
+			lats[i] = pt.Lat
+			lons[i] = pt.Lon
+		}
+		apiAlts, err := fetchOpenMeteoElevation(lats, lons)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: open-meteo elevation fetch failed (%v), falling back to FIT data\n", err)
+		} else {
+			// Attach API altitudes to GPS track points
+			apiAltsByDist = make(map[float64]float64, len(gpsTrack.Points))
+			for i := range gpsTrack.Points {
+				rounded := math.Round(apiAlts[i]*10) / 10
+				gpsTrack.Points[i].AltitudeApiM = &rounded
+				apiAltsByDist[gpsTrack.Points[i].DistanceKm*1000] = apiAlts[i]
+			}
+
+			// Recompute total ascent/descent from API altitudes
+			asc, desc := computeAscentDescent(apiAlts)
+			meta.TotalAscent = &asc
+			meta.TotalDescent = &desc
+		}
+	}
+
 	return Output{
 		UserProfile:     buildUserProfile(activity.UserProfile),
-		Metadata:        buildMetadata(sess),
+		Metadata:        meta,
 		RunningDynamics: buildSessionDynamics(sess),
 		Workout:         buildWorkout(activity.Workouts, activity.WorkoutSteps),
 		Laps:            laps,
 		Splits:          splits,
 		SplitSummaries:  summaries,
-		HeightProfile:   buildHeightProfile(activity.Records),
-		GpsTrack:        buildGpsTrack(activity.Records, gpsIntervalSec),
+		HeightProfile:   buildHeightProfile(activity.Records, apiAltsByDist),
+		GpsTrack:        gpsTrack,
 	}, nil
 }
 
 func main() {
 	outputFmt := flag.String("format", "yaml", "output format: yaml or json")
-	gpsInterval := flag.Int("gps-interval", 60, "GPS track sampling interval in seconds (0 to disable)")
+	gpsInterval := flag.Int("gps-interval", 60, "GPS track sampling interval in seconds (0 to disable; use --gps-dist-interval for distance-based sampling)")
+	gpsDistInterval := flag.Int("gps-dist-interval", 0, "GPS track sampling interval in metres (overrides --gps-interval when > 0)")
+	elevationSource := flag.String("elevation-source", "open-meteo", "elevation source: open-meteo or fit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: fit-analyzer [--format yaml|json] [--gps-interval N] <file.fit> [file2.fit ...]\n")
 		flag.PrintDefaults()
@@ -839,7 +1014,7 @@ func main() {
 	exitCode := 0
 	outputs := make([]Output, 0, flag.NArg())
 	for _, path := range flag.Args() {
-		out, err := analyzeFile(path, *gpsInterval)
+		out, err := analyzeFile(path, *gpsInterval, *gpsDistInterval, *elevationSource)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
 			exitCode = 1
