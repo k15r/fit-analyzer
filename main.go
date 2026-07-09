@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -235,11 +236,19 @@ type HeightProfilePoint struct {
 	AltitudeM  float64 `json:"altitude_m" yaml:"altitude_m"`
 }
 
+type KmElevation struct {
+	KmMark int `json:"km" yaml:"km"`
+	GainM  int `json:"gain_m" yaml:"gain_m"`
+	LossM  int `json:"loss_m" yaml:"loss_m"`
+}
+
 type HeightProfile struct {
 	MinAltitudeM float64              `json:"min_altitude_m" yaml:"min_altitude_m"`
 	MaxAltitudeM float64              `json:"max_altitude_m" yaml:"max_altitude_m"`
 	Points       []HeightProfilePoint `json:"points" yaml:"points"`
 	Sparkline    string               `json:"sparkline" yaml:"sparkline"`
+	KmElevation  []KmElevation        `json:"km_elevation,omitempty" yaml:"km_elevation,omitempty"`
+	SvgPath      string               `json:"svg_path,omitempty" yaml:"svg_path,omitempty"`
 }
 
 type UserProfile struct {
@@ -690,17 +699,11 @@ func fetchOpenMeteoElevation(lats, lons []float64) ([]float64, error) {
 	return result, nil
 }
 
-// computeAscentDescent sums elevation gains and losses from a sequence of altitudes.
-// A Gaussian-weighted smoothing pass (window=5) is applied first to suppress
-// SRTM measurement noise before differencing.
-func computeAscentDescent(alts []float64) (ascent, descent int) {
-	if len(alts) < 2 {
-		return
-	}
-
-	// Smooth with a simple 5-point moving average to suppress SRTM noise
-	smoothed := make([]float64, len(alts))
-	weights := []float64{1, 2, 3, 2, 1} // triangle kernel
+// smoothTriangle applies one pass of a 5-point triangular weighted moving
+// average. Call multiple times for stronger smoothing.
+func smoothTriangle(alts []float64) []float64 {
+	weights := []float64{1, 2, 3, 2, 1}
+	out := make([]float64, len(alts))
 	for i := range alts {
 		var s, w float64
 		for j, wj := range weights {
@@ -713,7 +716,22 @@ func computeAscentDescent(alts []float64) (ascent, descent int) {
 			s += alts[idx] * wj
 			w += wj
 		}
-		smoothed[i] = s / w
+		out[i] = s / w
+	}
+	return out
+}
+
+// computeAscentDescent sums elevation gains and losses from a sequence of altitudes.
+// Three passes of a 5-point triangular smoother (~36 m effective window at 1 Hz
+// GPS) are applied first to suppress noise before differencing.
+func computeAscentDescent(alts []float64) (ascent, descent int) {
+	if len(alts) < 2 {
+		return
+	}
+
+	smoothed := alts
+	for range 30 {
+		smoothed = smoothTriangle(smoothed)
 	}
 
 	var totalAscent, totalDescent float64
@@ -730,7 +748,85 @@ func computeAscentDescent(alts []float64) (ascent, descent int) {
 	return
 }
 
-// ---- height profile ----
+// naturalCubicSpline fits a natural cubic spline through the given (x, y) knots
+// (x must be strictly increasing) and returns a function that evaluates the
+// spline at any x in [x[0], x[n-1]]. Values outside the range are clamped to
+// the nearest endpoint.
+func naturalCubicSpline(xs, ys []float64) func(float64) float64 {
+	n := len(xs)
+	if n < 2 {
+		if n == 1 {
+			v := ys[0]
+			return func(float64) float64 { return v }
+		}
+		return func(float64) float64 { return 0 }
+	}
+
+	// Thomas algorithm for natural spline (second derivative = 0 at endpoints)
+	h := make([]float64, n-1)
+	for i := range h {
+		h[i] = xs[i+1] - xs[i]
+	}
+
+	// set up tridiagonal system for second derivatives (sigma)
+	size := n - 2
+	sigma := make([]float64, n) // sigma[0] = sigma[n-1] = 0
+	if size > 0 {
+		diag := make([]float64, size)
+		rhs := make([]float64, size)
+		for i := 0; i < size; i++ {
+			diag[i] = 2 * (h[i] + h[i+1])
+			rhs[i] = 6 * ((ys[i+2]-ys[i+1])/h[i+1] - (ys[i+1]-ys[i])/h[i])
+		}
+		// forward elimination
+		upper := make([]float64, size-1)
+		for i := 0; i < size-1; i++ {
+			upper[i] = h[i+1]
+		}
+		for i := 1; i < size; i++ {
+			m := h[i] / diag[i-1]
+			diag[i] -= m * upper[i-1]
+			rhs[i] -= m * rhs[i-1]
+		}
+		// back substitution
+		tmp := make([]float64, size)
+		tmp[size-1] = rhs[size-1] / diag[size-1]
+		for i := size - 2; i >= 0; i-- {
+			tmp[i] = (rhs[i] - upper[i]*tmp[i+1]) / diag[i]
+		}
+		for i := 0; i < size; i++ {
+			sigma[i+1] = tmp[i]
+		}
+	}
+
+	return func(x float64) float64 {
+		if x <= xs[0] {
+			return ys[0]
+		}
+		if x >= xs[n-1] {
+			return ys[n-1]
+		}
+		// binary search for interval
+		lo, hi := 0, n-2
+		for lo < hi {
+			mid := (lo + hi) / 2
+			if xs[mid+1] < x {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		i := lo
+		dx := xs[i+1] - xs[i]
+		t := x - xs[i]
+		a := (xs[i+1] - x) / dx
+		b := t / dx
+		return a*ys[i] + b*ys[i+1] +
+			((a*a*a-a)*sigma[i]+(b*b*b-b)*sigma[i+1])*(dx*dx)/6
+	}
+}
+
+
 
 // buildHeightProfile samples altitude adaptively from raw records.
 // If apiAltsByDist is non-nil it maps distance_m → terrain elevation from an
@@ -743,12 +839,6 @@ func computeAscentDescent(alts []float64) (ascent, descent int) {
 //
 // The final record is always emitted.
 func buildHeightProfile(records []*mesgdef.Record, apiAltsByDist map[float64]float64) *HeightProfile {
-	const (
-		minDistM     = 50.0  // minimum spacing between any two points
-		maxDistM     = 1000.0 // maximum spacing on flat terrain
-		steepThreshM = 2.0  // altitude change that triggers early emission
-	)
-
 	// collect valid (distance, altitude) pairs
 	type raw struct{ dist, alt float64 }
 	var pts []raw
@@ -785,36 +875,90 @@ func buildHeightProfile(records []*mesgdef.Record, apiAltsByDist map[float64]flo
 		return nil
 	}
 
-	// adaptive sampling
-	var sampled []HeightProfilePoint
-	lastDist := pts[0].dist
-	lastAlt := pts[0].alt
-	sampled = append(sampled, HeightProfilePoint{
-		DistanceKm: round3(lastDist / 1000.0),
-		AltitudeM:  math.Round(lastAlt*10) / 10,
-	})
-
-	for i := 1; i < len(pts); i++ {
-		p := pts[i]
-		dDist := p.dist - lastDist
-		dAlt := math.Abs(p.alt - lastAlt)
-		isLast := i == len(pts)-1
-
-		emit := isLast ||
-			(dDist >= minDistM && dAlt >= steepThreshM) ||
-			dDist >= maxDistM
-
-		if emit {
-			sampled = append(sampled, HeightProfilePoint{
-				DistanceKm: round3(p.dist / 1000.0),
-				AltitudeM:  math.Round(p.alt*10) / 10,
-			})
-			lastDist = p.dist
-			lastAlt = p.alt
+	// Pass 1: collect knots by grouping consecutive points into runs while
+	// cumulative altitude change stays within ±1 m. Each run becomes one knot
+	// placed at the run's midpoint distance with its average altitude.
+	// This way the spline node sits in the middle of each terrain level and
+	// slopes naturally into the next, instead of snapping at the transition edge.
+	maxDistM := pts[len(pts)-1].dist
+	var knots []raw
+	runStart := 0
+	for i := 1; i <= len(pts); i++ {
+		endOfData := i == len(pts)
+		crossed := !endOfData && math.Abs(pts[i].alt-pts[runStart].alt) > 1.0
+		if crossed || endOfData {
+			// average dist and alt over the run
+			var sumDist, sumAlt float64
+			for k := runStart; k < i; k++ {
+				sumDist += pts[k].dist
+				sumAlt += pts[k].alt
+			}
+			n := float64(i - runStart)
+			knots = append(knots, raw{sumDist / n, sumAlt / n})
+			runStart = i
 		}
 	}
 
-	// compute min/max and sparkline
+	kx := make([]float64, len(knots))
+	ky := make([]float64, len(knots))
+	for i, k := range knots {
+		kx[i] = k.dist
+		ky[i] = k.alt
+	}
+
+	// Pass 2: spline through the knots, sample at 50 m intervals
+	spline := naturalCubicSpline(kx, ky)
+
+	// sample spline at uniform 50 m intervals
+	var sampled []HeightProfilePoint
+	for d := 0.0; d <= maxDistM+0.5; d += 50.0 {
+		if d > maxDistM {
+			d = maxDistM
+		}
+		sampled = append(sampled, HeightProfilePoint{
+			DistanceKm: round3(d / 1000.0),
+			AltitudeM:  math.Round(spline(d)*10) / 10,
+		})
+		if d == maxDistM {
+			break
+		}
+	}
+
+	// per-km gain/loss from the spline-sampled series
+	type kmBucket struct{ gain, loss float64 }
+	buckets := map[int]*kmBucket{}
+	for i := 1; i < len(sampled); i++ {
+		km := int(sampled[i].DistanceKm)
+		d := sampled[i].AltitudeM - sampled[i-1].AltitudeM
+		b := buckets[km]
+		if b == nil {
+			b = &kmBucket{}
+			buckets[km] = b
+		}
+		if d > 0 {
+			b.gain += d
+		} else {
+			b.loss -= d
+		}
+	}
+	var kmElevation []KmElevation
+	for km := 0; ; km++ {
+		b, ok := buckets[km]
+		if !ok {
+			if km > int(sampled[len(sampled)-1].DistanceKm) {
+				break
+			}
+			kmElevation = append(kmElevation, KmElevation{KmMark: km + 1})
+			continue
+		}
+		kmElevation = append(kmElevation, KmElevation{
+			KmMark: km + 1,
+			GainM:  int(math.Round(b.gain)),
+			LossM:  int(math.Round(b.loss)),
+		})
+	}
+
+	// min/max and sparkline from smoothed sampled points
 	minAlt := sampled[0].AltitudeM
 	maxAlt := sampled[0].AltitudeM
 	for _, sp := range sampled {
@@ -842,6 +986,7 @@ func buildHeightProfile(records []*mesgdef.Record, apiAltsByDist map[float64]flo
 		MaxAltitudeM: math.Round(maxAlt*10) / 10,
 		Points:       sampled,
 		Sparkline:    string(spark),
+		KmElevation:  kmElevation,
 	}
 }
 
@@ -995,13 +1140,191 @@ func analyzeFile(path string, gpsIntervalSec int, gpsDistIntervalM int, elevatio
 	}, nil
 }
 
+// ---- SVG rendering ----
+
+func renderHeightProfileSVG(hp *HeightProfile) string {
+	const (
+		svgW    = 800
+		svgH    = 200
+		padLeft = 60
+		padRight  = 20
+		padTop    = 20
+		padBottom = 40
+	)
+	plotW := float64(svgW - padLeft - padRight)
+	plotH := float64(svgH - padTop - padBottom)
+	plotBottom := float64(svgH - padBottom)
+
+	pts := hp.Points
+	if len(pts) == 0 {
+		return ""
+	}
+
+	maxDist := pts[len(pts)-1].DistanceKm
+	minAlt := hp.MinAltitudeM
+	maxAlt := hp.MaxAltitudeM
+	// ensure the Y axis spans at least 30 m so flat runs don't look hilly
+	const minAltSpanM = 30.0
+	if maxAlt-minAlt < minAltSpanM {
+		mid := (minAlt + maxAlt) / 2
+		minAlt = mid - minAltSpanM/2
+		maxAlt = mid + minAltSpanM/2
+	}
+	altRange := maxAlt - minAlt
+
+	xScale := func(km float64) float64 {
+		if maxDist == 0 {
+			return float64(padLeft)
+		}
+		return float64(padLeft) + km/maxDist*plotW
+	}
+	yScale := func(alt float64) float64 {
+		return float64(padTop) + (1-(alt-minAlt)/altRange)*plotH
+	}
+
+	// convert points to screen coordinates
+	type pt struct{ x, y float64 }
+	spts := make([]pt, len(pts))
+	for i, p := range pts {
+		spts[i] = pt{xScale(p.DistanceKm), yScale(p.AltitudeM)}
+	}
+
+	// catmullRomPath builds a smooth SVG path through the screen points using
+	// Catmull-Rom converted to cubic bezier control points (tension = 0.5).
+	catmullRomPath := func(points []pt) string {
+		if len(points) < 2 {
+			return ""
+		}
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "M %.2f,%.2f", points[0].x, points[0].y)
+		for i := 0; i < len(points)-1; i++ {
+			p0 := points[max(i-1, 0)]
+			p1 := points[i]
+			p2 := points[i+1]
+			p3 := points[min(i+2, len(points)-1)]
+			cp1x := p1.x + (p2.x-p0.x)/6
+			cp1y := p1.y + (p2.y-p0.y)/6
+			cp2x := p2.x - (p3.x-p1.x)/6
+			cp2y := p2.y - (p3.y-p1.y)/6
+			fmt.Fprintf(&sb, " C %.2f,%.2f %.2f,%.2f %.2f,%.2f",
+				cp1x, cp1y, cp2x, cp2y, p2.x, p2.y)
+		}
+		return sb.String()
+	}
+
+	// filled area path: drop to bottom, trace curve, close
+	linePath := catmullRomPath(spts)
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "M %.2f,%.2f ", spts[0].x, plotBottom)
+	fmt.Fprintf(&sb, "L %.2f,%.2f ", spts[0].x, spts[0].y)
+	sb.WriteString(linePath[len(fmt.Sprintf("M %.2f,%.2f", spts[0].x, spts[0].y)):])
+	fmt.Fprintf(&sb, " L %.2f,%.2f Z", spts[len(spts)-1].x, plotBottom)
+	areaPath := sb.String()
+
+	// nice Y-axis ticks
+	niceStep := func(rng float64) float64 {
+		for _, s := range []float64{1, 2, 5, 10, 25, 50, 100, 200, 500} {
+			if rng/s <= 5 {
+				return s
+			}
+		}
+		return math.Ceil(rng / 5)
+	}
+	step := niceStep(altRange)
+	firstTick := math.Ceil(minAlt/step) * step
+	var yTicks []float64
+	for t := firstTick; t <= maxAlt+step*0.01; t += step {
+		yTicks = append(yTicks, t)
+	}
+
+	// X-axis km ticks
+	totalKm := int(math.Ceil(maxDist))
+	labelEvery := 1
+	if totalKm > 20 {
+		labelEvery = 5
+	} else if totalKm > 9 {
+		labelEvery = 2
+	}
+
+	var out strings.Builder
+	out.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
+	fmt.Fprintf(&out, `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d">`+"\n", svgW, svgH, svgW, svgH)
+
+	// gradient
+	out.WriteString(`  <defs>` + "\n")
+	out.WriteString(`    <linearGradient id="hpGrad" x1="0" y1="0" x2="0" y2="1">` + "\n")
+	out.WriteString(`      <stop offset="0%" stop-color="#4a90d9" stop-opacity="0.7"/>` + "\n")
+	out.WriteString(`      <stop offset="100%" stop-color="#4a90d9" stop-opacity="0.1"/>` + "\n")
+	out.WriteString(`    </linearGradient>` + "\n")
+	out.WriteString(`  </defs>` + "\n")
+
+	// background
+	fmt.Fprintf(&out, `  <rect width="%d" height="%d" fill="#f8f9fa"/>`, svgW, svgH)
+	out.WriteString("\n")
+
+	// horizontal grid lines at Y ticks
+	for _, t := range yTicks {
+		y := yScale(t)
+		if y < float64(padTop) || y > plotBottom {
+			continue
+		}
+		fmt.Fprintf(&out, `  <line x1="%d" y1="%.2f" x2="%d" y2="%.2f" stroke="#ddd" stroke-width="1"/>`,
+			padLeft, y, svgW-padRight, y)
+		out.WriteString("\n")
+	}
+
+	// filled area
+	fmt.Fprintf(&out, `  <path d="%s" fill="url(#hpGrad)"/>`, areaPath)
+	out.WriteString("\n")
+
+	// stroke line
+	fmt.Fprintf(&out, `  <path d="%s" fill="none" stroke="#2171b5" stroke-width="1.5" stroke-linejoin="round"/>`, linePath)
+	out.WriteString("\n")
+
+	// axes
+	fmt.Fprintf(&out, `  <line x1="%d" y1="%.2f" x2="%d" y2="%.2f" stroke="#888" stroke-width="1"/>`,
+		padLeft, float64(padTop), padLeft, plotBottom)
+	out.WriteString("\n")
+	fmt.Fprintf(&out, `  <line x1="%d" y1="%.2f" x2="%d" y2="%.2f" stroke="#888" stroke-width="1"/>`,
+		padLeft, plotBottom, svgW-padRight, plotBottom)
+	out.WriteString("\n")
+
+	// Y-axis labels
+	for _, t := range yTicks {
+		y := yScale(t)
+		if y < float64(padTop) || y > plotBottom {
+			continue
+		}
+		fmt.Fprintf(&out, `  <text x="%d" y="%.2f" text-anchor="end" font-family="sans-serif" font-size="10" fill="#555">%dm</text>`,
+			padLeft-4, y+3.5, int(t))
+		out.WriteString("\n")
+	}
+
+	// X-axis km ticks and labels
+	for km := 0; km <= totalKm; km++ {
+		x := xScale(float64(km))
+		fmt.Fprintf(&out, `  <line x1="%.2f" y1="%.2f" x2="%.2f" y2="%.2f" stroke="#888" stroke-width="1"/>`,
+			x, plotBottom, x, plotBottom+4)
+		out.WriteString("\n")
+		if km%labelEvery == 0 {
+			fmt.Fprintf(&out, `  <text x="%.2f" y="%.2f" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#555">%dkm</text>`,
+				x, plotBottom+15, km)
+			out.WriteString("\n")
+		}
+	}
+
+	out.WriteString("</svg>\n")
+	return out.String()
+}
+
 func main() {
 	outputFmt := flag.String("format", "yaml", "output format: yaml or json")
+	svgDir := flag.String("svg-dir", "", "directory to write SVG height profiles (default: next to .fit file)")
 	gpsInterval := flag.Int("gps-interval", 60, "GPS track sampling interval in seconds (0 to disable; use --gps-dist-interval for distance-based sampling)")
 	gpsDistInterval := flag.Int("gps-dist-interval", 0, "GPS track sampling interval in metres (overrides --gps-interval when > 0)")
 	elevationSource := flag.String("elevation-source", "open-meteo", "elevation source: open-meteo or fit")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: fit-analyzer [--format yaml|json] [--gps-interval N] <file.fit> [file2.fit ...]\n")
+		fmt.Fprintf(os.Stderr, "Usage: fit-analyzer [--format yaml|json] [--svg-dir DIR] [--gps-interval N] <file.fit> [file2.fit ...]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -1013,12 +1336,28 @@ func main() {
 
 	exitCode := 0
 	outputs := make([]Output, 0, flag.NArg())
-	for _, path := range flag.Args() {
-		out, err := analyzeFile(path, *gpsInterval, *gpsDistInterval, *elevationSource)
+	for _, fitPath := range flag.Args() {
+		out, err := analyzeFile(fitPath, *gpsInterval, *gpsDistInterval, *elevationSource)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
+			fmt.Fprintf(os.Stderr, "%s: %v\n", fitPath, err)
 			exitCode = 1
 			continue
+		}
+		if out.HeightProfile != nil {
+			svg := renderHeightProfileSVG(out.HeightProfile)
+			if svg != "" {
+				base := strings.TrimSuffix(filepath.Base(fitPath), filepath.Ext(fitPath)) + ".svg"
+				dir := filepath.Dir(fitPath)
+				if *svgDir != "" {
+					dir = *svgDir
+				}
+				svgPath := filepath.Join(dir, base)
+				if werr := os.WriteFile(svgPath, []byte(svg), 0644); werr != nil {
+					fmt.Fprintf(os.Stderr, "WARNING: could not write SVG %s: %v\n", svgPath, werr)
+				} else {
+					out.HeightProfile.SvgPath = svgPath
+				}
+			}
 		}
 		outputs = append(outputs, out)
 	}
